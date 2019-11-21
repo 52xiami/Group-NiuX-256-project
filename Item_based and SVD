@@ -1,0 +1,175 @@
+import pandas as pd
+import json
+import ast
+import sqlite3
+import numpy as np
+from surprise import SVD
+from surprise import NMF
+from surprise import KNNBasic
+from surprise import Reader
+from surprise import Dataset
+from surprise.model_selection import cross_validate
+from surprise.model_selection import train_test_split
+from surprise import accuracy
+from surprise.model_selection import GridSearchCV
+from surprise.model_selection import KFold
+from sklearn.model_selection import train_test_split
+
+from sklearn import preprocessing
+## Analysis tools 
+from sklearn.metrics import confusion_matrix,classification_report, accuracy_score, make_scorer
+from sklearn import model_selection
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.model_selection import train_test_split
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import MultiLabelBinarizer
+from sklearn.neighbors import NearestNeighbors
+
+with sqlite3.connect('steam_data.sqlite') as conn:
+    steam_games = pd.read_sql("SELECT * FROM steam_games",conn)
+    aus_user_reviews_df = pd.read_sql("SELECT * FROM australian_user_reviews",conn)
+    aus_user_items_df = pd.read_sql("SELECT * FROM australian_users_items",conn)
+    bundle_df = pd.read_sql("SELECT * FROM bundle_data",conn)
+    
+drop_columns = ['index', 'items_count', 'steam_id', 'user_url','item_name', 'playtime_forever','playtime_2weeks']
+aus_user_items_df.drop(drop_columns, inplace = True, axis=1)
+
+# form game genres binary dataframe
+user_game_genres = pd.read_sql("select user_id, item_id, genres, discount_price, price from australian_user_reviews left join steam_games on item_id=id where recommend=True and genres is not null and genres <>'null' and specs is not null and specs <>'null' and tags is not null and tags <>'null';", conn)
+mlb = MultiLabelBinarizer()
+encoded = pd.DataFrame(mlb.fit_transform(user_game_genres['genres'].apply(eval)), columns=mlb.classes_)
+user_game_genres['discount_price'].fillna(0, inplace=True)
+user_game_genres['price'].replace({'Play the Demo':0,'Play WARMACHINE: Tactics Demo':0,'Install Now':0,'Free Mod':0,'Third-party':0,'Free To Play': 0, 'Free to Play':0,'free':0,'Free':0, 'Play for Free!':0, 'Free HITMAN™ Holiday Pack':0}, inplace=True)
+genres_result = pd.concat([user_game_genres['item_id'], user_game_genres['discount_price'], user_game_genres['price'], encoded], axis=1)
+
+# remove duplicates under item_id
+genres_result.drop_duplicates(['item_id'], inplace=True)
+
+# price column min-max normalization
+x_price = genres_result[['price']].values.astype(float)
+
+# Create a minimum and maximum processor object
+min_max_scaler = preprocessing.MinMaxScaler()
+
+# Create an object to transform the data to fit minmax processor
+x_price_scaled = min_max_scaler.fit_transform(x_price)
+genres_result['price'] = pd.DataFrame(x_price_scaled)
+
+
+# discount_price column min-max normalization
+x_discount_price = genres_result[['discount_price']].values.astype(float)
+
+# Create a minimum and maximum processor object
+min_max_scaler = preprocessing.MinMaxScaler()
+
+# Create an object to transform the data to fit minmax processor
+x_discount_price_scaled = min_max_scaler.fit_transform(x_discount_price)
+
+genres_result['discount_price'] = pd.DataFrame(x_discount_price_scaled)
+
+
+#form game specs binary dataframe
+user_game_specs = pd.read_sql("select item_id, specs from australian_user_reviews left join steam_games on item_id=id where recommend=True and specs is not null and genres <>'null';", conn)
+mlb = MultiLabelBinarizer()
+encoded = pd.DataFrame(mlb.fit_transform(user_game_genres['genres'].apply(eval)), columns=mlb.classes_)
+specs_result = pd.concat([user_game_specs['item_id'], encoded], axis=1)
+
+#remove duplicates under item_id
+specs_result.drop_duplicates(['item_id'], inplace=True)
+
+#form game tags binary dataframe
+user_game_tags = pd.read_sql("select item_id, tags from australian_user_reviews left join steam_games on item_id=id where recommend=True and tags is not null and tags <>'null';", conn)
+mlb = MultiLabelBinarizer()
+encoded = pd.DataFrame(mlb.fit_transform(user_game_tags['tags'].apply(eval)), columns=mlb.classes_)
+tags_result = pd.concat([user_game_specs['item_id'], encoded], axis=1)
+
+
+#remove duplicates under item_id
+tags_result.drop_duplicates(['item_id'], inplace=True)
+
+item_df = pd.merge(genres_result, specs_result, on = 'item_id')
+item_df = pd.merge(item_df, tags_result, on = 'item_id')
+item_df.fillna(0, inplace=True)
+
+# item_list including all items
+item_list=[]
+for item in item_df['item_id']:
+    item_list.append(item)
+    
+    
+# based on user's purchase record to find the 5 most similar items in the unpurchased item list  
+def item_based_recommendation(user_id, number=5):
+    number = number
+    user_item_purchased_df = aus_user_items_df[aus_user_items_df['user_id']== user_id].reset_index(drop=True)
+    user_item_purchased_df = pd.merge(user_item_purchased_df, item_df, on = 'item_id', how = 'left')
+    user_item_purchased_df.dropna(inplace = True)
+    user_item_purchased_list=[]
+    user_item_unpurchased_list=[]
+    user_item_recommend_list=[]
+    for item in user_item_purchased_df['item_id']:
+        user_item_purchased_list.append(item)
+    for item in item_list:
+        if(item not in user_item_purchased_list):
+            user_item_unpurchased_list.append(item)
+    user_item_unpurchased_df = pd.DataFrame()
+    user_item_unpurchased_df['item_id'] = user_item_unpurchased_list
+    # form a DataFrame including user's unpurchased items
+    user_item_unpurchased_df = pd.merge(user_item_unpurchased_df, item_df, on = 'item_id', how = 'left')
+    # only look for 1 nearest neighbor
+    neigh = NearestNeighbors(n_neighbors=1)
+    neigh.fit(user_item_unpurchased_df.drop('item_id',axis=1)) 
+    user_columns = ['user_id', 'item_id']
+    user_item_neighbor_list = neigh.kneighbors(user_item_purchased_df.drop(user_columns, axis=1), return_distance=False)
+    if(len(user_item_neighbor_list)>number):
+        for item in user_item_neighbor_list[:number]:
+            user_item_recommend_list.append(user_item_unpurchased_df['item_id'].iloc[item])
+    else:
+        for item in user_item_neighbor_list:
+            user_item_recommend_list.append(user_item_unpurchased_df['item_id'].iloc[item])
+    return user_item_recommend_list
+    
+###### SVD model    
+reader = Reader(rating_scale=(0, 1))
+data_training = Dataset.load_from_df(aus_user_reviews_df[['user_id', 'item_id', 'recommend']], reader)
+
+trainset, testset = train_test_split(data_training, test_size=.25)
+
+# SVD Algorithm
+algo_svd = SVD(n_factors= 400, reg_all=0.001)
+kf = KFold(n_splits=5)
+
+
+for trainset, testset in kf.split(data_training):
+
+    # train and test algorithm.
+    algo_svd.fit(trainset)
+    predictions = algo_svd.test(testset)
+
+    # Compute and print Root Mean Squared Error
+    accuracy.rmse(predictions, verbose=True)
+    
+    
+def SVD_model_recommendation(user_id, number=5):
+    number = number
+    user_item_purchased_df = aus_user_items_df[aus_user_items_df['user_id']== user_id].reset_index(drop=True)
+    user_item_purchased_df = pd.merge(user_item_purchased_df, item_df, on = 'item_id', how = 'left')
+    user_item_purchased_df.dropna(inplace = True)
+    user_item_purchased_list=[]
+    user_item_unpurchased_list=[]
+    user_item_recommend_list=[]
+    for item in user_item_purchased_df['item_id']:
+        user_item_purchased_list.append(item)
+    for item in item_list:
+        if(item not in user_item_purchased_list):
+            user_item_unpurchased_list.append(item)
+    user_item_unpurchased_df = pd.DataFrame()
+    user_item_unpurchased_df['item_id'] = user_item_unpurchased_list
+    user_item_unpurchased_df['user_id'] = user_id
+    user_item_unpurchased_df['recommend'] = np.nan
+    data_testing = Dataset.load_from_df(user_item_unpurchased_df[['user_id', 'item_id', 'recommend']], reader)
+    data_testingset = data_testing.build_full_trainset().build_testset()
+    predictions = algo_svd.test(data_testingset)
+    predictions_df = pd.DataFrame(predictions)
+    predictions_df.sort_values(by='est', ascending=False, inplace=True)
+   
+    return predictions_df['item_id'][:number]
